@@ -1,0 +1,39 @@
+# polym2 overrides for a private, bounded collection run.
+#
+# Layered on top of docker-compose.polymarket.yml, never instead of it:
+#
+#   docker compose -f docker-compose.polymarket.yml -f docker-compose.polym2.yml up -d --build
+#
+# Deliberately a separate file rather than edits in place, so the fork stays
+# readable as a diff against upstream. Three departures from upstream:
+#
+#   1. EXCLUDE_HASH=false — we keep Polymarket's book hash in the data. Upstream
+#      strips it; we need it to audit the dedup change after the fact.
+#   2. LOCAL_OUTPUT_DIR — hourly Parquet lands on disk instead of in R2, in the
+#      same `polymarket/v2/` layout the pmxt mirror uses, so polym2's
+#      research/ scripts read it unchanged via PMXT_ARCHIVE_ROOT.
+#   3. TTL_MINUTES — ClickHouse is a buffer for the exporter, not the archive.
+#      Only takes effect on a *fresh* table: the sink applies the TTL clause at
+#      CREATE TABLE, so changing it later does nothing until the table is
+#      dropped.
+#
+# COLLECTOR_OUT is the host directory the snapshots are written to; set it in
+# .env or the environment. Everything else is upstream's default.
+
+services:
+  obdata-polymarket-orderbook-rust-pubsub:
+    environment:
+      EXCLUDE_HASH: "false"
+
+  obdata-polymarket-orderbook-rust-from-pubsub:
+    environment:
+      EXCLUDE_HASH: "false"
+      # ~2 days. Enough for the exporter (which lags an hour) to drain, and it
+      # keeps ClickHouse near 30-45 GB at full-firehose volume.
+      TTL_MINUTES: "2880"
+
+  obdata-polymarket-r2-archive-exporter:
+    environment:
+      LOCAL_OUTPUT_DIR: /out
+    volumes:
+      - ${COLLECTOR_OUT:?set COLLECTOR_OUT to the host output directory}:/out
