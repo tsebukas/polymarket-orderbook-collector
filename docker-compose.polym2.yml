@@ -24,6 +24,14 @@ services:
   obdata-polymarket-orderbook-rust-pubsub:
     environment:
       EXCLUDE_HASH: "false"
+      # Upstream's 500 puts ~272k assets on ~1090 connections, and that does not
+      # hold from a single address: the client PINGs every connection every 10 s
+      # and kills any socket whose PONG is over 5 s late (ws/connection.rs), so
+      # ~109 PING/s starts timing out, every timeout reconnects and re-subscribes
+      # its assets, and the added load times out the next batch. Observed half
+      # the pool down and worsening, with 64k assets on no live connection at
+      # all. 2500 puts the same universe on ~220 connections.
+      MAX_ASSETS_PER_CONN: "2500"
 
   obdata-polymarket-orderbook-rust-from-pubsub:
     environment:
