@@ -1,10 +1,12 @@
-"""Hourly orderbook → Cloudflare R2 exporter.
+"""Hourly orderbook snapshot exporter.
 
 Reads one hour of orderbook rows from ClickHouse, re-encodes to Parquet
 with DELTA_BINARY_PACKED on integer timestamp columns and ZSTD(9)
-dictionary encoding elsewhere, and uploads to R2. ClickHouse's own
-FORMAT Parquet writer never emits DELTA, so we fetch FORMAT ArrowStream
-and re-encode client-side (pass 6 in docs/data-dump-optimizations.md).
+dictionary encoding elsewhere, and writes it to Cloudflare R2 — or, when
+``LOCAL_OUTPUT_DIR`` is set, to that directory instead, in which case no R2
+credentials are needed. ClickHouse's own FORMAT Parquet writer never emits
+DELTA, so we fetch FORMAT ArrowStream and re-encode client-side (pass 6 in
+docs/data-dump-optimizations.md).
 
 Profiles, selected via ``EXPORTER_PROFILE`` env (default ``polymarket``):
 
@@ -36,6 +38,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 
 import boto3
 import pyarrow as pa
@@ -59,6 +62,11 @@ R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
 R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "")
+
+# Local filesystem destination. When set, snapshots are written here and R2
+# is not used (and its credentials are not required) — for running the
+# collector privately, where the archive is a directory rather than a bucket.
+LOCAL_OUTPUT_DIR = os.environ.get("LOCAL_OUTPUT_DIR", "")
 
 # Export
 PARQUET_COMPRESSION = "zstd"
@@ -369,6 +377,40 @@ class R2Client:
         self._client.upload_fileobj(BytesIO(data), self._bucket, key)
 
 
+# ---------- Local filesystem ----------
+
+
+class LocalSink:
+    """Filesystem stand-in for [`R2Client`], selected by ``LOCAL_OUTPUT_DIR``.
+
+    Same three-method surface, so ``backfill`` and ``run_loop`` do not care
+    which destination they were handed. Writes go through a ``.part`` file and
+    an ``os.replace``, so a reader — or an rsync pulling the directory while
+    the exporter runs — never observes a half-written snapshot.
+    """
+
+    def __init__(self, directory: str) -> None:
+        self._dir = Path(directory)
+
+    def ensure_bucket(self) -> None:
+        self._dir.mkdir(parents=True, exist_ok=True)
+        log.info("Writing snapshots to %s", self._dir)
+
+    def list_keys(self) -> set[str]:
+        return {p.name for p in self._dir.glob(f"{FILENAME_PREFIX}*.parquet")}
+
+    def upload(self, key: str, data: bytes) -> None:
+        final = self._dir / key
+        partial = final.with_suffix(final.suffix + ".part")
+        partial.write_bytes(data)
+        os.replace(partial, final)
+
+
+# Either destination satisfies the ensure_bucket / list_keys / upload surface
+# that the orchestration below uses; nothing there cares which one it holds.
+Destination = R2Client | LocalSink
+
+
 # ---------- Export orchestration ----------
 
 
@@ -386,7 +428,7 @@ def latest_exportable_hour() -> datetime:
     return now - timedelta(hours=EXPORT_LAG_HOURS)
 
 
-def export_hour(client: R2Client, hour: datetime) -> bool:
+def export_hour(client: Destination, hour: datetime) -> bool:
     """Fetch one hour from ClickHouse and upload it to R2.
 
     Returns True if an object was uploaded, False if the hour has no rows
@@ -403,7 +445,7 @@ def export_hour(client: R2Client, hour: datetime) -> bool:
     return True
 
 
-def backfill(client: R2Client) -> None:
+def backfill(client: Destination) -> None:
     """Export every missing hour from ClickHouse to R2."""
     earliest = query_earliest_hour()
     if earliest is None:
@@ -433,7 +475,7 @@ def backfill(client: R2Client) -> None:
             log.error("Failed to export %s: %s", hour.isoformat(), e)
 
 
-def run_loop(client: R2Client) -> None:
+def run_loop(client: Destination) -> None:
     """Steady-state loop: export each new hour shortly after it completes.
 
     Advances only on successful upload — empty hours are re-polled on the
@@ -466,18 +508,31 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
-    missing = [v for v in ("R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET")
-               if not globals()[v]]
-    if missing:
-        log.error("Missing required environment variables: %s", ", ".join(missing))
-        sys.exit(1)
+    client: Destination
+    if LOCAL_OUTPUT_DIR:
+        client = LocalSink(LOCAL_OUTPUT_DIR)
+        client.ensure_bucket()
+        log.info(
+            "Exporting to %s, profile=%s, source_table=%s, filename_prefix=%s, order_by=%s",
+            LOCAL_OUTPUT_DIR, PROFILE.name, CLICKHOUSE_TABLE, FILENAME_PREFIX, SELECT_ORDER_BY,
+        )
+    else:
+        missing = [v for v in ("R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET")
+                   if not globals()[v]]
+        if missing:
+            log.error(
+                "Missing required environment variables: %s "
+                "(or set LOCAL_OUTPUT_DIR to export to the filesystem instead)",
+                ", ".join(missing),
+            )
+            sys.exit(1)
 
-    client = R2Client(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET)
-    client.ensure_bucket()
-    log.info(
-        "Connected to R2 at %s, bucket=%s, profile=%s, source_table=%s, filename_prefix=%s, order_by=%s",
-        R2_ENDPOINT, R2_BUCKET, PROFILE.name, CLICKHOUSE_TABLE, FILENAME_PREFIX, SELECT_ORDER_BY,
-    )
+        client = R2Client(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET)
+        client.ensure_bucket()
+        log.info(
+            "Connected to R2 at %s, bucket=%s, profile=%s, source_table=%s, filename_prefix=%s, order_by=%s",
+            R2_ENDPOINT, R2_BUCKET, PROFILE.name, CLICKHOUSE_TABLE, FILENAME_PREFIX, SELECT_ORDER_BY,
+        )
 
     backfill(client)
     run_loop(client)
