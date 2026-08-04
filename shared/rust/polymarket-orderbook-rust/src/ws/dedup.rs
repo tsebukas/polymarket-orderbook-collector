@@ -10,21 +10,40 @@
 //!
 //! ## Dedup keys
 //!
-//! Each event collapses to a `u64`. For the two event types Polymarket gives
-//! us a content hash for, we just parse the first 16 hex chars of that hash
-//! into a `u64` — the source is already a cryptographic hash, so any 64-bit
-//! slice is uniformly distributed and there's no point re-hashing it. For
-//! the other two we hash the identifying tuple with [`DefaultHasher`].
+//! Each event collapses to a `u64`. `book` uses Polymarket's own content
+//! hash — we parse the first 16 hex chars into a `u64`, since the source is
+//! already a cryptographic hash and any 64-bit slice of it is uniformly
+//! distributed. The other three hash their identifying tuple with
+//! [`DefaultHasher`].
 //!
 //! | event              | key source                                  |
 //! |--------------------|---------------------------------------------|
 //! | `book`             | `hex_prefix_u64(hash)`                      |
-//! | `price_change`     | `hex_prefix_u64(hash)`  (per exploded entry)|
+//! | `price_change`     | `DefaultHasher(market, asset, timestamp, price, size, side)` (per exploded entry) |
 //! | `last_trade_price` | `DefaultHasher(market, asset, timestamp, price, size, side, fee_rate, transaction_hash)` |
 //! | `tick_size_change` | `DefaultHasher(asset, timestamp, old, new)` |
 //!
 //! `last_trade_price` cannot use `transaction_hash` alone because a single
 //! Ethereum transaction can settle multiple fills.
+//!
+//! ### Why `price_change` must not key on the hash
+//!
+//! Polymarket's `hash` is a function of the resulting book **state**, so it
+//! repeats whenever a book returns to a state it recently held — an order
+//! placed and then cancelled, which is the ordinary rhythm of a busy book.
+//! Keying on it made this cache treat that second, genuinely new event as a
+//! duplicate and drop it. A consumer replaying the delta stream then never
+//! learned the level had gone away, and kept resting size at prices that were
+//! already cleared. The damage scaled with activity: busy books cycle through
+//! repeated states inside one cache lifetime, quiet books never do.
+//!
+//! The payload tuple has no such failure mode, and it is no weaker against
+//! the duplicates this cache actually exists to absorb: both redundant
+//! connections deliver the same wire message, so their exploded entries agree
+//! on every field of the tuple. Two *distinct* changes colliding on the tuple
+//! would need the same asset, millisecond, price, size and side — and because
+//! `size` is an absolute level size rather than an increment, applying such an
+//! event twice is idempotent, so collapsing them loses nothing either.
 //!
 //! ## Two-generation cache
 //!
@@ -97,19 +116,36 @@ impl DedupCache {
 }
 
 /// Compute the dedup key for an [`Event`]. See module docs for the per-kind
-/// strategy. Panics if a `Book` or `PriceChange` reaches this point with a
-/// missing hash, which the wire layer (where `hash: String` is required)
-/// rules out.
+/// strategy. Panics if a `Book` reaches this point with a missing hash, which
+/// the wire layer (where `hash: String` is required) rules out.
 pub fn dedup_key(ev: &Event) -> u64 {
     match ev {
         Event::Book { hash, .. } => hex_prefix_u64(
             hash.as_deref()
                 .expect("Book.hash must be present (wire layer enforces this)"),
         ),
-        Event::PriceChange { hash, .. } => hex_prefix_u64(
-            hash.as_deref()
-                .expect("PriceChange.hash must be present (wire layer enforces this)"),
-        ),
+        // Deliberately not keyed on `hash`: it is a book-state hash and
+        // recurs on ordinary place-then-cancel churn. See module docs.
+        Event::PriceChange {
+            market,
+            asset_id,
+            timestamp,
+            price,
+            size,
+            side,
+            ..
+        } => {
+            let mut h = DefaultHasher::new();
+            "price_change".hash(&mut h);
+            market.hash(&mut h);
+            asset_id.hash(&mut h);
+            timestamp.hash(&mut h);
+            // Decimal doesn't impl Hash; round-trip via its string form.
+            price.to_string().hash(&mut h);
+            size.to_string().hash(&mut h);
+            side.hash(&mut h);
+            h.finish()
+        }
         Event::LastTradePrice {
             market,
             asset_id,
@@ -243,6 +279,10 @@ mod tests {
     }
 
     fn pc(asset: &str, hash: &str) -> Event {
+        pc_at(asset, hash, "0.5", "10", "BUY")
+    }
+
+    fn pc_at(asset: &str, hash: &str, price: &str, size: &str, side: &str) -> Event {
         Event::PriceChange {
             market: "m".into(),
             asset_id: asset.into(),
@@ -250,9 +290,9 @@ mod tests {
             best_bid: None,
             best_ask: None,
             hash: Some(hash.into()),
-            price: dec("0.5"),
-            size: dec("10"),
-            side: "BUY".into(),
+            price: dec(price),
+            size: dec(size),
+            side: side.into(),
         }
     }
 
@@ -320,10 +360,41 @@ mod tests {
     }
 
     #[test]
-    fn dedup_key_price_change_uses_hash() {
+    fn dedup_key_price_change_identical_payload_collides() {
+        // What the cache exists for: both redundant connections deliver the
+        // same wire message, so every field of the tuple agrees.
         let k1 = dedup_key(&pc("a", "56621a121a47ed9333273e21c83b660cff37ae50"));
         let k2 = dedup_key(&pc("a", "56621a121a47ed9333273e21c83b660cff37ae50"));
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn dedup_key_price_change_ignores_hash() {
+        // A book-state hash recurs on place-then-cancel churn. Two genuinely
+        // different changes must stay distinct even when the hash repeats —
+        // keying on the hash dropped the second one and left replays holding
+        // size at levels that were already gone.
+        // Every event below shares one hash; only the payload differs.
+        let h = "56621a121a47ed9333273e21c83b660cff37ae50";
+        let cancel = dedup_key(&pc_at("a", h, "0.5", "0", "BUY"));
+        let place = dedup_key(&pc_at("a", h, "0.5", "10", "BUY"));
+        assert_ne!(cancel, place, "size must separate them");
+
+        let other_side = dedup_key(&pc_at("a", h, "0.5", "10", "SELL"));
+        assert_ne!(place, other_side, "side must separate them");
+
+        let other_price = dedup_key(&pc_at("a", h, "0.6", "10", "BUY"));
+        assert_ne!(place, other_price, "price must separate them");
+
+        // And conversely: a differing hash must not split one real event.
+        let h2 = "11112222333344445566778899aabbccddeeff00";
+        assert_eq!(place, dedup_key(&pc_at("a", h2, "0.5", "10", "BUY")));
+    }
+
+    #[test]
+    fn dedup_key_price_change_distinct_per_asset() {
+        let h = "56621a121a47ed9333273e21c83b660cff37ae50";
+        assert_ne!(dedup_key(&pc("a", h)), dedup_key(&pc("b", h)));
     }
 
     #[test]
@@ -394,6 +465,22 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no second event");
         assert_eq!(fwd.forwarded.load(Ordering::Relaxed), 1);
         assert_eq!(fwd.dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn forwarder_keeps_both_halves_of_a_place_then_cancel() {
+        // The regression this module's price_change key exists to prevent:
+        // a book returning to a recent state repeats the hash, and the second
+        // event used to be absorbed as a duplicate.
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let fwd = DedupForwarder::new(Duration::from_secs(10), tx);
+        let h = "56621a121a47ed9333273e21c83b660cff37ae50";
+        fwd.try_send(pc_at("a", h, "0.5", "10", "BUY")).unwrap();
+        fwd.try_send(pc_at("a", h, "0.5", "0", "BUY")).unwrap();
+        assert!(rx.recv().await.is_some(), "the place reaches the sink");
+        assert!(rx.recv().await.is_some(), "so does the cancel");
+        assert_eq!(fwd.forwarded.load(Ordering::Relaxed), 2);
+        assert_eq!(fwd.dropped.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
