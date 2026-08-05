@@ -28,6 +28,15 @@ services:
   obdata-clickhouse:
     labels:
       com.centurylinklabs.watchtower.enable: "false"
+    # Backstop for the memory limits in clickhouse-config.d/polym2-memory.xml.
+    # The host has 14 GB, a dozen unrelated services and a KVM guest take ~6.6 GB,
+    # and the collector's own Rust services measured ~3.7 GB at full scope, which
+    # leaves ClickHouse about 4.6 GB. 4 GB here with 3.5 GiB configured inside
+    # means ClickHouse refuses work before the cgroup acts, and the cgroup acts
+    # before the kernel starts choosing victims across the whole host.
+    mem_limit: 4g
+    volumes:
+      - ./clickhouse-config.d/polym2-memory.xml:/etc/clickhouse-server/config.d/polym2-memory.xml:ro
 
   obdata-redis:
     labels:

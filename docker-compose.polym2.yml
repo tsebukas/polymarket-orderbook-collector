@@ -72,9 +72,21 @@ services:
     logging: *rotated-logs
     environment:
       EXCLUDE_HASH: "false"
-      # ~2 days. Enough for the exporter (which lags an hour) to drain, and it
-      # keeps ClickHouse near 30-45 GB at full-firehose volume.
-      TTL_MINUTES: "2880"
+      # 6 hours, down from the 2 days this started at. ClickHouse is a buffer
+      # for the exporter, which lags one hour -- 6 gives it six times the margin
+      # it needs and nothing here is the archive.
+      #
+      # The 2-day value was sized against the archive's ~24.5k rows/s. Our fork
+      # captures ~36k rows/s, because keeping the events upstream's hash-dedup
+      # dropped is the entire point, and at that rate a 2-day table is ~6.3
+      # billion rows. Background merges over it took ClickHouse to 5.4 GB RSS on
+      # a 14 GB host shared with a dozen other services, and the kernel OOM-killed
+      # it 17 times in 75 minutes on 2026-08-05. Every one of those restarts is a
+      # permanent hole, because the sink is fire-and-forget.
+      #
+      # 6 hours puts the table near 780M rows and the merges within budget.
+      # TTL is applied in CREATE TABLE, so changing this needs a fresh table.
+      TTL_MINUTES: "360"
 
   obdata-polymarket-r2-archive-exporter:
     logging: *rotated-logs

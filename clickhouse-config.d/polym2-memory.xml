@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!--
+  polym2: bound ClickHouse's memory on a shared host.
+
+  Mounted into /etc/clickhouse-server/config.d/ by docker-compose.infra.polym2.yml.
+  Only meaningful for our private collection run; upstream's deployment has the
+  box to itself and needs none of this.
+
+  Background: on 2026-08-05 the kernel OOM-killed clickhouse-server 17 times in
+  75 minutes. The host has 14 GB and runs a dozen unrelated services plus a KVM
+  guest, so ClickHouse had roughly 4.6 GB to work with and was reaching 5.4 GB
+  under merge load. The kill was `global_oom`, not a cgroup limit -- meaning the
+  kernel was picking a victim host-wide and could as easily have taken something
+  else down.
+
+  Two defences, and the order matters:
+
+    - `max_server_memory_usage` makes ClickHouse refuse work it cannot afford,
+      returning MEMORY_LIMIT_EXCEEDED instead of growing into the OOM killer.
+      A failed insert is a visible error in the sink's [DATA-GAP] log; an
+      OOM kill is a silent restart. Both lose data, but only one tells you.
+    - `mem_limit` in the compose overlay is the backstop, one step above this,
+      so a miss here is contained to this container rather than the host.
+-->
+<clickhouse>
+    <!-- 3.5 GiB. Sits below the 4 GB cgroup limit in the compose overlay so
+         ClickHouse hits its own accounting first and can fail gracefully. -->
+    <max_server_memory_usage>3758096384</max_server_memory_usage>
+
+    <!-- Fewer concurrent merges means a lower peak. The insert path is cheap at
+         our rate; it was merges over a multi-billion-row table that blew the
+         budget, and the 6-hour TTL plus this together keep them small. -->
+    <background_pool_size>8</background_pool_size>
+
+    <!-- Do not start a merge that would need more than 10 GB of free disk. Not
+         a memory setting, but the same class of protection: `/` is shared with
+         the OS and every other service on this box. -->
+    <max_bytes_to_merge_at_max_space_in_pool>10737418240</max_bytes_to_merge_at_max_space_in_pool>
+</clickhouse>
