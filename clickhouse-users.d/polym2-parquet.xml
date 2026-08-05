@@ -1,28 +1,26 @@
 <?xml version="1.0"?>
 <!--
-  polym2: make the hourly Parquet export fit in a bounded ClickHouse.
+  polym2: let the hourly export finish on a memory-constrained box.
 
   Mounted into /etc/clickhouse-server/users.d/ by docker-compose.infra.polym2.yml.
   These are query-level settings, so they belong in a profile rather than in the
   server config next door.
 
-  The exporter runs one `SELECT * ... FORMAT Parquet` per hour. ClickHouse buffers
-  a whole row group before writing it, and the defaults are 1M rows / 512 MB. At
-  our volume a full hour is ~153M rows, and on 2026-08-05 that combination hit
-  the memory ceiling every single time: the exporter retried the same hour every
-  60 seconds for hours and produced nothing.
+  What the exporter actually sends, which took a while to establish and is worth
+  writing down because it is not what it looks like from the outside:
 
-  Measured on hour 16 of that day, exporting with the ceiling at 3.5 GiB:
+    SELECT timestamp_received, timestamp, market, event_type,
+           JSONExtractString(data, 'asset_id') AS asset_id, ...
+    FROM polymarket_orderbook_rust
+    WHERE timestamp_received >= <hour> AND timestamp_received < <hour> + 1 HOUR
+    ORDER BY market, asset_id, timestamp_received
+    FORMAT ArrowStream
 
-    defaults          HTTP 500 immediately
-    100k rows / 64 MB truncated at 6.5 MB
-    25k rows / 16 MB  truncated at 416 MB
-    10k rows / 8 MB   truncated at 762 MB
-
-  Smaller groups get progressively further because less is held at once, but they
-  do not fix it alone. The ceiling had to come up as well, since the export
-  competes with ongoing inserts and merges rather than running on a quiet server.
-  Both halves are needed; neither is sufficient.
+  Two things follow. It sorts the whole hour, which at our volume is 25M to 153M
+  rows and is where the memory goes: failing exports reported 6.65 GiB of query
+  memory. And it streams Arrow, writing the Parquet client-side, so none of the
+  output_format_parquet_* settings below ever touched it; those only apply to
+  ad-hoc FORMAT Parquet queries run by hand.
 
   Careful with comments here: XML forbids a double hyphen inside one, and
   ClickHouse refuses to start on a malformed config rather than skipping it.
@@ -30,30 +28,31 @@
 <clickhouse>
     <profiles>
         <default>
-            <output_format_parquet_row_group_size>10000</output_format_parquet_row_group_size>
-            <output_format_parquet_row_group_size_bytes>8388608</output_format_parquet_row_group_size_bytes>
+            <!-- The fix. Above this much, the sort spills to disk instead of
+                 being held whole. Sorting an hour is inherent to how the
+                 exporter builds its files, so the choice is between spilling and
+                 failing; there is 270 GB free and the export has an hour to
+                 write an hour. -->
+            <max_bytes_before_external_sort>2147483648</max_bytes_before_external_sort>
 
-            <!-- The one that actually made the export complete.
-
-                 With the default parallelism ClickHouse reads far faster than
-                 the HTTP client can write the result to disk, and buffers the
-                 difference: failing exports reported 5.5 to 6.0 GiB of query
-                 memory. Held to one thread the read paces itself against the
-                 writer and the same hour finishes at 76 MiB.
-
-                 Measured on hour 16, 153M rows, with the ceiling at 7.2 GiB:
+            <!-- Pace the reader against whatever consumes the result. With
+                 default parallelism ClickHouse reads far faster than the client
+                 writes and buffers the difference. Measured on hour 16, 153M
+                 rows, on a hand-run SELECT * FORMAT Parquet:
 
                    default threads  failed at 3.64 GB after 188 s
-                   max_threads=2    failed at 1.33 GB after 48 s
+                   max_threads=2    failed at 1.33 GB after  48 s
                    max_threads=1    COMPLETE, 5.54 GB in 394 s
 
-                 Slower, and it does not matter: the exporter has an hour to
-                 write an hour, and 394 seconds is well inside that.
-
-                 Set on the profile rather than per query so the exporter picks
-                 it up without touching upstream's Python. Nothing else queries
-                 this server. -->
+                 394 seconds to write an hour that took 3600 to collect is not a
+                 constraint worth optimising away. -->
             <max_threads>1</max_threads>
+
+            <!-- For hand-run FORMAT Parquet queries only, per the note above.
+                 ClickHouse buffers a whole row group before writing it and the
+                 defaults are 1M rows / 512 MB, which is far too much here. -->
+            <output_format_parquet_row_group_size>10000</output_format_parquet_row_group_size>
+            <output_format_parquet_row_group_size_bytes>8388608</output_format_parquet_row_group_size_bytes>
         </default>
     </profiles>
 </clickhouse>
