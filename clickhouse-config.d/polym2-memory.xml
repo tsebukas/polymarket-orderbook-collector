@@ -9,18 +9,22 @@
   Background: on 2026-08-05 the kernel OOM-killed clickhouse-server 17 times in
   75 minutes. The host has 14 GB and runs a dozen unrelated services plus a KVM
   guest, so ClickHouse had roughly 4.6 GB to work with and was reaching 5.4 GB
-  under merge load. The kill was `global_oom`, not a cgroup limit -- meaning the
-  kernel was picking a victim host-wide and could as easily have taken something
-  else down.
+  under merge load. The kill was `global_oom` rather than a cgroup limit, meaning
+  the kernel was picking a victim host-wide and could as easily have taken
+  something else down.
 
   Two defences, and the order matters:
 
-    - `max_server_memory_usage` makes ClickHouse refuse work it cannot afford,
-      returning MEMORY_LIMIT_EXCEEDED instead of growing into the OOM killer.
-      A failed insert is a visible error in the sink's [DATA-GAP] log; an
-      OOM kill is a silent restart. Both lose data, but only one tells you.
-    - `mem_limit` in the compose overlay is the backstop, one step above this,
-      so a miss here is contained to this container rather than the host.
+    1. `max_server_memory_usage` makes ClickHouse refuse work it cannot afford,
+       returning MEMORY_LIMIT_EXCEEDED instead of growing into the OOM killer.
+       A failed insert is a visible error in the sink's [DATA-GAP] log; an
+       OOM kill is a silent restart. Both lose data, but only one tells you.
+    2. `mem_limit` in the compose overlay is the backstop, one step above this,
+       so a miss here is contained to this container rather than the host.
+
+  Careful with comments in this file: XML forbids a double hyphen inside one,
+  and ClickHouse refuses to start on a malformed config rather than skipping it,
+  which crash-loops the container.
 -->
 <clickhouse>
     <!-- 3.5 GiB. Sits below the 4 GB cgroup limit in the compose overlay so
