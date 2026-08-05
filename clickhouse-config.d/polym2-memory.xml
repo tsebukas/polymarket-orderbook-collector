@@ -40,7 +40,17 @@
   which crash-loops the container.
 -->
 <clickhouse>
-    <!-- 3.5 GiB. Sits below the 4 GB cgroup limit in the compose overlay so
-         ClickHouse hits its own accounting first and can fail gracefully. -->
-    <max_server_memory_usage>3758096384</max_server_memory_usage>
+    <!-- 4.5 GiB, sitting below the 5 GB cgroup limit in the compose overlay so
+         ClickHouse hits its own accounting first and can fail gracefully.
+
+         Started at 3.5 GiB, which held the database up but starved the hourly
+         export: a full hour is ~153M rows and the export competes with live
+         inserts and merges rather than running on a quiet server, so it failed
+         at every row-group size tried. See clickhouse-users.d/polym2-parquet.xml
+         for those measurements.
+
+         Not raised further because the host has 14 GB and the rest of it is
+         spoken for: the three collector services measure ~4.7 GB together and
+         the unrelated containers another ~2.5 GB. -->
+    <max_server_memory_usage>4831838208</max_server_memory_usage>
 </clickhouse>

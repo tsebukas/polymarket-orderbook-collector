@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<!--
+  polym2: make the hourly Parquet export fit in a bounded ClickHouse.
+
+  Mounted into /etc/clickhouse-server/users.d/ by docker-compose.infra.polym2.yml.
+  These are query-level settings, so they belong in a profile rather than in the
+  server config next door.
+
+  The exporter runs one `SELECT * ... FORMAT Parquet` per hour. ClickHouse buffers
+  a whole row group before writing it, and the defaults are 1M rows / 512 MB. At
+  our volume a full hour is ~153M rows, and on 2026-08-05 that combination hit
+  the memory ceiling every single time: the exporter retried the same hour every
+  60 seconds for hours and produced nothing.
+
+  Measured on hour 16 of that day, exporting with the ceiling at 3.5 GiB:
+
+    defaults          HTTP 500 immediately
+    100k rows / 64 MB truncated at 6.5 MB
+    25k rows / 16 MB  truncated at 416 MB
+    10k rows / 8 MB   truncated at 762 MB
+
+  Smaller groups get progressively further because less is held at once, but they
+  do not fix it alone. The ceiling had to come up as well, since the export
+  competes with ongoing inserts and merges rather than running on a quiet server.
+  Both halves are needed; neither is sufficient.
+
+  Careful with comments here: XML forbids a double hyphen inside one, and
+  ClickHouse refuses to start on a malformed config rather than skipping it.
+-->
+<clickhouse>
+    <profiles>
+        <default>
+            <output_format_parquet_row_group_size>10000</output_format_parquet_row_group_size>
+            <output_format_parquet_row_group_size_bytes>8388608</output_format_parquet_row_group_size_bytes>
+        </default>
+    </profiles>
+</clickhouse>
