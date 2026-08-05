@@ -8,10 +8,34 @@
 //!
 //! Polymarket uses **application-level** PING/PONG text messages, not
 //! WebSocket protocol ping frames. Per the Polymarket docs, the client
-//! sends `"PING"` every **10 s** and the server responds `"PONG"`. We wait
-//! 5 s for the PONG; if it's missed, the socket is closed and the run loop
-//! reconnects immediately (no backoff). Other failures use exponential
-//! backoff (1 → 60 s).
+//! sends `"PING"` every [`Heartbeat::ping_interval`] and the server responds
+//! `"PONG"`. If no PONG arrives within [`Heartbeat::pong_timeout`], the socket
+//! is closed and the run loop reconnects immediately (no backoff). Other
+//! failures use exponential backoff (1 → 60 s).
+//!
+//! The overdue check runs on the PING ticker, so `pong_timeout` is enforced at
+//! `ping_interval` resolution — a socket is reaped at the first tick at or
+//! after the deadline, not on the deadline itself.
+//!
+//! **The two timings are independent, and that independence had to be built.**
+//! The check used to compare against the *most recent* PING, which the ticker
+//! overwrote on every tick. `sent_at.elapsed()` was therefore always one whole
+//! `ping_interval`, which made two things true and neither obvious:
+//!
+//! 1. `pong_timeout` had no effect at all below `ping_interval` — the real
+//!    deadline was `ping_interval`.
+//! 2. Any `pong_timeout >= ping_interval` disabled dead-connection detection
+//!    **entirely**: the threshold could never be reached before the next tick
+//!    reset the timestamp it was measured from.
+//!
+//! So the obvious way to give a busy socket more time — raise `pong_timeout` —
+//! silently turned the heartbeat off instead. Tracking the *oldest* unanswered
+//! PING rather than the most recent is what fixes it; see [`pong_overdue`].
+//!
+//! This matters when one socket carries thousands of assets: PONG is a text
+//! message in the *same* stream as the data, so it queues behind whatever is
+//! already in flight and can legitimately arrive seconds late on a healthy
+//! connection.
 //!
 //! ## Subscription state
 //!
@@ -68,9 +92,33 @@ pub enum ConnStatus {
 /// Per Polymarket docs (Market & User channels): client sends `"PING"`
 /// every 10 seconds. We deviated to 5 s historically, matching a stale
 /// docstring in the Python service — see the module-level docs.
-const PING_INTERVAL: Duration = Duration::from_secs(10);
-const PONG_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(10);
+/// Upstream's historical value. Preserved as the default so a checkout with no
+/// heartbeat configuration behaves as before; a run whose sockets each carry
+/// thousands of assets wants considerably more (`PONG_TIMEOUT_SECONDS`).
+pub const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
+
+/// Heartbeat timings for one connection. See the module-level docs for why
+/// these two are independent knobs and what happens when they are not.
+#[derive(Debug, Clone, Copy)]
+pub struct Heartbeat {
+    /// How often `"PING"` is sent. Also the resolution at which `pong_timeout`
+    /// is evaluated, since the check runs on the same ticker.
+    pub ping_interval: Duration,
+    /// How long the oldest unanswered `"PING"` may stay outstanding before the
+    /// socket is declared dead. May exceed `ping_interval`.
+    pub pong_timeout: Duration,
+}
+
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self {
+            ping_interval: DEFAULT_PING_INTERVAL,
+            pong_timeout: DEFAULT_PONG_TIMEOUT,
+        }
+    }
+}
 
 /// Stats exposed to the pool for periodic logging. All counters are
 /// atomically updated by the connection's task; the pool reads them via
@@ -127,6 +175,7 @@ pub struct Connection {
     pub forwarder: Arc<DedupForwarder>,
     pub status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
     pub stats: Arc<ConnStats>,
+    pub heartbeat: Heartbeat,
 }
 
 impl Connection {
@@ -134,12 +183,14 @@ impl Connection {
         index: usize,
         forwarder: Arc<DedupForwarder>,
         status_tx: mpsc::UnboundedSender<(usize, ConnStatus)>,
+        heartbeat: Heartbeat,
     ) -> Self {
         Self {
             index,
             forwarder,
             status_tx,
             stats: Arc::new(ConnStats::default()),
+            heartbeat,
         }
     }
 
@@ -158,6 +209,7 @@ impl Connection {
             forwarder,
             status_tx,
             stats,
+            heartbeat,
         } = self;
         let mut sub = SubState::default();
         let mut backoff = Duration::from_secs(1);
@@ -233,6 +285,7 @@ impl Connection {
                 &stats,
                 &mut commands,
                 &mut last_message_time,
+                heartbeat,
             )
             .await;
 
@@ -309,6 +362,7 @@ async fn run_session(
     stats: &ConnStats,
     commands: &mut mpsc::Receiver<Command>,
     last_message_time: &mut Option<Instant>,
+    heartbeat: Heartbeat,
 ) -> SessionOutcome {
     let (mut write, mut read) = ws_stream.split();
 
@@ -323,13 +377,19 @@ async fn run_session(
         sub.subscribed.extend(sub.desired.iter().cloned());
     }
 
-    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    let mut ping_interval = tokio::time::interval(heartbeat.ping_interval);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the first immediate tick.
     ping_interval.tick().await;
 
     let mut last_pong = Instant::now();
-    let mut last_ping_sent: Option<Instant> = None;
+    // The *oldest* PING still waiting for a PONG, or `None` when the peer is
+    // caught up. Set when a PING goes out on an otherwise-answered connection
+    // and cleared by any PONG, so it measures how long the peer has been
+    // silent rather than how long ago we last spoke. Tracking the oldest
+    // rather than the most recent is what keeps `pong_timeout` independent of
+    // `ping_interval` — see the module docs.
+    let mut oldest_unanswered: Option<Instant> = None;
 
     let mut events_buf: Vec<Event> = Vec::new();
 
@@ -345,6 +405,7 @@ async fn run_session(
                     }
                     if stripped == "PONG" {
                         last_pong = Instant::now();
+                        oldest_unanswered = None;
                         debug!(conn = index, "PONG received");
                         continue;
                     }
@@ -404,26 +465,27 @@ async fn run_session(
 
             // -- PING ticker --------------------------------------------
             _ = ping_interval.tick() => {
-                // Before sending the next PING, check whether the previous
-                // PING ever got its PONG. If we sent at T and `last_pong`
-                // is still earlier than T after PONG_TIMEOUT, the connection
-                // is dead.
-                if let Some(sent_at) = last_ping_sent {
-                    if last_pong < sent_at && sent_at.elapsed() >= PONG_TIMEOUT {
-                        warn!(
-                            conn = index,
-                            since_pong_secs = last_pong.elapsed().as_secs_f64(),
-                            "PONG timeout, closing dead connection",
-                        );
-                        let _ = write.send(Message::Close(None)).await;
-                        return SessionOutcome::PongTimeout;
-                    }
+                // Before sending the next PING, check whether the oldest one
+                // still outstanding has gone unanswered past the deadline.
+                if pong_overdue(oldest_unanswered, Instant::now(), heartbeat.pong_timeout) {
+                    warn!(
+                        conn = index,
+                        since_pong_secs = last_pong.elapsed().as_secs_f64(),
+                        pong_timeout_secs = heartbeat.pong_timeout.as_secs_f64(),
+                        "PONG timeout, closing dead connection",
+                    );
+                    let _ = write.send(Message::Close(None)).await;
+                    return SessionOutcome::PongTimeout;
                 }
                 if let Err(e) = write.send(Message::Text("PING".into())).await {
                     warn!(conn = index, error = %e, "send PING failed");
                     return SessionOutcome::Closed;
                 }
-                last_ping_sent = Some(Instant::now());
+                // Only the first PING of an unanswered run starts the clock;
+                // later ones must not push the deadline back.
+                if oldest_unanswered.is_none() {
+                    oldest_unanswered = Some(Instant::now());
+                }
             }
 
             // -- Pool commands ------------------------------------------
@@ -554,6 +616,20 @@ where
         .map_err(|e| anyhow::anyhow!("ws send: {e}"))?;
     info!(conn = index, count = assets.len(), "unsubscribed assets");
     Ok(())
+}
+
+/// Whether the oldest unanswered `"PING"` has been outstanding for at least
+/// `pong_timeout`. `None` means the peer has answered everything we sent.
+///
+/// Split out of the session loop so the decision can be tested without a
+/// socket. It is worth testing: the previous version measured from the *most
+/// recent* PING, which the ticker overwrote every `ping_interval`, and the
+/// resulting bug was silent in both directions — see the module docs.
+fn pong_overdue(oldest_unanswered: Option<Instant>, now: Instant, pong_timeout: Duration) -> bool {
+    match oldest_unanswered {
+        Some(sent_at) => now.duration_since(sent_at) >= pong_timeout,
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -689,5 +765,71 @@ mod tests {
         assert_eq!(stats.books.load(Ordering::Relaxed), 0);
         // Lifetime counter is unaffected.
         assert_eq!(stats.reconnects.load(Ordering::Relaxed), 3);
+    }
+
+    /// `Instant` `secs` ago, for driving `pong_overdue` without sleeping.
+    fn ago(secs: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .expect("test clock underflow")
+    }
+
+    #[test]
+    fn pong_overdue_is_false_when_everything_is_answered() {
+        assert!(!pong_overdue(None, Instant::now(), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn pong_overdue_respects_the_configured_deadline() {
+        let timeout = Duration::from_secs(30);
+        assert!(
+            !pong_overdue(Some(ago(29)), Instant::now(), timeout),
+            "29 s outstanding is inside a 30 s deadline",
+        );
+        assert!(
+            pong_overdue(Some(ago(31)), Instant::now(), timeout),
+            "31 s outstanding is past a 30 s deadline",
+        );
+    }
+
+    #[test]
+    fn pong_timeout_above_ping_interval_still_reaps() {
+        // Regression, and the reason `pong_overdue` exists. The old check
+        // measured from the most recent PING, which the ticker rewrote every
+        // `ping_interval`; the measured age was therefore pinned at one
+        // interval and could never reach a larger `pong_timeout`. Raising the
+        // timeout to give a busy socket room silently disabled the heartbeat
+        // instead of loosening it.
+        let hb = Heartbeat {
+            ping_interval: Duration::from_secs(10),
+            pong_timeout: Duration::from_secs(60),
+        };
+        assert!(
+            !pong_overdue(Some(ago(30)), Instant::now(), hb.pong_timeout),
+            "a socket 30 s silent is still within a 60 s deadline",
+        );
+        assert!(
+            pong_overdue(Some(ago(61)), Instant::now(), hb.pong_timeout),
+            "a socket silent past the deadline must still be reaped",
+        );
+    }
+
+    #[test]
+    fn pong_overdue_measures_the_oldest_ping_not_the_latest() {
+        // Three PINGs go out unanswered at 10 s intervals. The deadline is
+        // measured from the first of them, so a 25 s timeout has expired even
+        // though the most recent PING left moments ago.
+        let oldest = ago(30);
+        assert!(
+            pong_overdue(Some(oldest), Instant::now(), Duration::from_secs(25)),
+            "the clock must start at the first unanswered PING",
+        );
+    }
+
+    #[test]
+    fn heartbeat_defaults_match_upstream() {
+        let hb = Heartbeat::default();
+        assert_eq!(hb.ping_interval, Duration::from_secs(10));
+        assert_eq!(hb.pong_timeout, Duration::from_secs(5));
     }
 }

@@ -49,6 +49,16 @@ pub struct Config {
     /// receiving the same event (sub-second typically).
     pub dedup_ttl: Duration,
 
+    // -- WebSocket heartbeat --------------------------------------------------
+    /// How often each connection sends the application-level `"PING"`, and the
+    /// resolution at which `pong_timeout` is enforced.
+    pub ping_interval: Duration,
+    /// How long the oldest unanswered `"PING"` may stay outstanding before the
+    /// socket is declared dead. Worth raising well above the default when a
+    /// single socket carries thousands of assets: PONG shares the stream with
+    /// the data and queues behind it. See `ws::connection` module docs.
+    pub pong_timeout: Duration,
+
     // -- ClickHouse TTL ------------------------------------------------------
     /// Optional row-level TTL in minutes applied to `timestamp_received`.
     /// When set, ClickHouse automatically drops rows older than this.
@@ -103,6 +113,10 @@ impl Config {
 
             // Redundant connections
             dedup_ttl: Duration::from_secs(env_parse("DEDUP_TTL_SECONDS", 10_u64)?),
+
+            // WebSocket heartbeat
+            ping_interval: Duration::from_secs(env_parse("PING_INTERVAL_SECONDS", 10_u64)?),
+            pong_timeout: Duration::from_secs(env_parse("PONG_TIMEOUT_SECONDS", 5_u64)?),
 
             // ClickHouse TTL
             ttl_minutes: env_parse("TTL_MINUTES", 0_u64)?,
@@ -203,6 +217,8 @@ mod tests {
             "REDIS_KEY_ACTIVE_MARKETS_COUNT",
             "ORDERBOOK_CONSUMER_GROUP",
             "ORDERBOOK_CONSUMER_NAME",
+            "PING_INTERVAL_SECONDS",
+            "PONG_TIMEOUT_SECONDS",
         ]
         .iter()
         .map(|k| (k.to_string(), std::env::var(k).ok()))
@@ -232,6 +248,8 @@ mod tests {
         assert_eq!(cfg.redis_key_active_markets_count, "polymarket:active_markets:count");
         assert_eq!(cfg.flush_batch_size, 5000);
         assert_eq!(cfg.flush_interval, Duration::from_millis(500));
+        assert_eq!(cfg.ping_interval, Duration::from_secs(10));
+        assert_eq!(cfg.pong_timeout, Duration::from_secs(5));
 
         // Restore.
         for (k, v) in snapshot {
@@ -250,16 +268,25 @@ mod tests {
         std::env::set_var("CLICKHOUSE_PORT", "9000");
         std::env::set_var("EXCLUDE_HASH", "true");
         std::env::set_var("MAX_ASSETS_PER_CONN", "100");
+        std::env::set_var("PING_INTERVAL_SECONDS", "15");
+        std::env::set_var("PONG_TIMEOUT_SECONDS", "60");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.clickhouse_url, "http://ch.internal:9000");
         assert!(cfg.exclude_hash);
         assert_eq!(cfg.max_assets_per_conn, 100);
+        assert_eq!(cfg.ping_interval, Duration::from_secs(15));
+        // Deliberately larger than ping_interval: that combination is the
+        // whole point of making the timeout configurable, and it used to be
+        // the one value that silently disabled the heartbeat.
+        assert_eq!(cfg.pong_timeout, Duration::from_secs(60));
 
         std::env::remove_var("REDIS_URL");
         std::env::remove_var("CLICKHOUSE_HOST");
         std::env::remove_var("CLICKHOUSE_PORT");
         std::env::remove_var("EXCLUDE_HASH");
         std::env::remove_var("MAX_ASSETS_PER_CONN");
+        std::env::remove_var("PING_INTERVAL_SECONDS");
+        std::env::remove_var("PONG_TIMEOUT_SECONDS");
     }
 }

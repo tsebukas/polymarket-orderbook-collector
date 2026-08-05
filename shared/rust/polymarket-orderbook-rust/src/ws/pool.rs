@@ -52,7 +52,7 @@ use tracing::{debug, info, warn};
 use serde_json::json;
 
 use crate::events::{Event, Market};
-use crate::ws::connection::{Command, ConnStats, ConnStatus, Connection};
+use crate::ws::connection::{Command, ConnStats, ConnStatus, Connection, Heartbeat};
 use crate::ws::dedup::DedupForwarder;
 
 /// Mailbox capacity for each connection's command channel.
@@ -98,6 +98,8 @@ pub struct HealthCounters {
 
 pub struct Pool {
     max_assets_per_conn: usize,
+    /// Heartbeat timings handed to every connection this pool spawns.
+    heartbeat: Heartbeat,
     #[allow(dead_code)]
     dedup_ttl: Duration,
     #[allow(dead_code)]
@@ -121,6 +123,7 @@ impl Pool {
     pub fn new(
         max_assets_per_conn: usize,
         dedup_ttl: Duration,
+        heartbeat: Heartbeat,
         event_tx: mpsc::Sender<Event>,
     ) -> Self {
         let forwarder = DedupForwarder::new(dedup_ttl, event_tx.clone());
@@ -137,6 +140,7 @@ impl Pool {
 
         Self {
             max_assets_per_conn,
+            heartbeat,
             dedup_ttl,
             event_tx,
             forwarder,
@@ -426,7 +430,12 @@ impl Pool {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL_SIZE);
         let status_tx = self.status_event_tx.clone();
 
-        let conn = Connection::new(conn_id, Arc::clone(&self.forwarder), status_tx);
+        let conn = Connection::new(
+            conn_id,
+            Arc::clone(&self.forwarder),
+            status_tx,
+            self.heartbeat,
+        );
         let stats = Arc::clone(&conn.stats);
         let join = tokio::spawn(conn.run(cmd_rx));
 
@@ -786,7 +795,7 @@ mod tests {
 
     fn pool(max_assets: usize) -> Pool {
         let (tx, _rx) = mpsc::channel::<Event>(1024);
-        Pool::new(max_assets, Duration::from_secs(10), tx)
+        Pool::new(max_assets, Duration::from_secs(10), Heartbeat::default(), tx)
     }
 
     #[tokio::test]

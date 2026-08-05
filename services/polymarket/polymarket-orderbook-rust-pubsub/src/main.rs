@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use polymarket_orderbook_rust::events::{Event, Market};
 use polymarket_orderbook_rust::markets;
 use polymarket_orderbook_rust::markets::stream::StreamConfig;
+use polymarket_orderbook_rust::ws::connection::Heartbeat;
 use polymarket_orderbook_rust::ws::pool::Pool;
 
 use polymarket_orderbook_rust_pubsub::config::Config;
@@ -75,9 +76,21 @@ async fn main() -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<Event>(cfg.queue_size);
     let sink_handle: JoinHandle<Result<()>> = tokio::spawn(sink.run(event_rx));
 
+    let heartbeat = Heartbeat {
+        ping_interval: cfg.ping_interval,
+        pong_timeout: cfg.pong_timeout,
+    };
+    info!(
+        max_assets_per_conn = cfg.max_assets_per_conn,
+        ping_interval_secs = heartbeat.ping_interval.as_secs(),
+        pong_timeout_secs = heartbeat.pong_timeout.as_secs(),
+        "connection pool settings",
+    );
+
     let pool = Arc::new(Mutex::new(Pool::new(
         cfg.max_assets_per_conn,
         cfg.dedup_ttl,
+        heartbeat,
         event_tx.clone(),
     )));
 

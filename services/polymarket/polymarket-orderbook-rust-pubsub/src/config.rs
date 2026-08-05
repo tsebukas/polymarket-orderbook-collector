@@ -29,6 +29,18 @@ pub struct Config {
     pub queue_size: usize,
     pub max_assets_per_conn: usize,
     pub dedup_ttl: Duration,
+
+    // -- WebSocket heartbeat --------------------------------------------------
+    /// How often each connection sends the application-level `"PING"`, and the
+    /// resolution at which `pong_timeout` is enforced.
+    pub ping_interval: Duration,
+    /// How long the oldest unanswered `"PING"` may stay outstanding before the
+    /// socket is declared dead. Raise it well above the default when
+    /// `max_assets_per_conn` is large: PONG is a text message in the same
+    /// stream as the data, so on a socket carrying thousands of assets it
+    /// queues behind them and arrives late on a perfectly healthy connection.
+    /// See the `ws::connection` module docs.
+    pub pong_timeout: Duration,
 }
 
 impl Config {
@@ -59,6 +71,9 @@ impl Config {
             queue_size: env_parse("QUEUE_SIZE", 5_000_000)?,
             max_assets_per_conn: env_parse("MAX_ASSETS_PER_CONN", 200)?,
             dedup_ttl: Duration::from_secs(env_parse("DEDUP_TTL_SECONDS", 10_u64)?),
+
+            ping_interval: Duration::from_secs(env_parse("PING_INTERVAL_SECONDS", 10_u64)?),
+            pong_timeout: Duration::from_secs(env_parse("PONG_TIMEOUT_SECONDS", 5_u64)?),
         })
     }
 }
@@ -116,6 +131,8 @@ mod tests {
         "DEDUP_TTL_SECONDS",
         "MAX_BATCH",
         "LINGER_MS",
+        "PING_INTERVAL_SECONDS",
+        "PONG_TIMEOUT_SECONDS",
     ];
 
     fn snapshot_env() -> Vec<(String, Option<String>)> {
@@ -176,6 +193,8 @@ mod tests {
         assert_eq!(cfg.dedup_ttl, Duration::from_secs(10));
         assert_eq!(cfg.publish_batch_max, 200);
         assert_eq!(cfg.publish_linger, Duration::from_millis(2));
+        assert_eq!(cfg.ping_interval, Duration::from_secs(10));
+        assert_eq!(cfg.pong_timeout, Duration::from_secs(5));
 
         restore_env(snap);
     }
@@ -191,12 +210,18 @@ mod tests {
         std::env::set_var("DEDUP_TTL_SECONDS", "30");
         std::env::set_var("ORDERBOOK_CONSUMER_GROUP", "g1");
         std::env::set_var("ORDERBOOK_CONSUMER_NAME", "c1");
+        std::env::set_var("PING_INTERVAL_SECONDS", "15");
+        std::env::set_var("PONG_TIMEOUT_SECONDS", "60");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.redis_url, "redis://r:6379");
         assert_eq!(cfg.redis_pubsub_channel, "my:custom:channel");
         assert_eq!(cfg.max_assets_per_conn, 100);
         assert_eq!(cfg.dedup_ttl, Duration::from_secs(30));
+        assert_eq!(cfg.ping_interval, Duration::from_secs(15));
+        // Deliberately larger than ping_interval — the combination the old
+        // heartbeat check could not express, and the one this run needs.
+        assert_eq!(cfg.pong_timeout, Duration::from_secs(60));
         assert_eq!(cfg.stream_consumer_group, "g1");
         assert_eq!(cfg.stream_consumer_name, "c1");
 
