@@ -90,13 +90,20 @@ services:
 
   obdata-polymarket-r2-archive-exporter:
     logging: *rotated-logs
-    # The exporter now streams an hour rather than holding it, so it should sit
-    # a few hundred MB regardless of how big the hour is. This bounds a
-    # regression to the container: restart: unless-stopped revives it and the
-    # hour is retried, instead of the kernel picking a victim across a 14 GB
-    # host. On 2026-08-05 it picked this process at 5.5 GB, and before that
-    # ClickHouse.
-    mem_limit: 1g
+    # Measured, not guessed: streaming the 153M-row hour of 2026-08-05T16
+    # plateaued at 1.12 GiB and finished in 543 s. It plateaus rather than
+    # ramping, which is the whole point — the same figure should hold for any
+    # hour, since peak is one row group and not the export.
+    #
+    # 2g leaves ~80% headroom over that measurement. It bounds a regression to
+    # this container, where restart: unless-stopped revives it and the hour is
+    # retried, instead of the kernel picking a victim across a 14 GB host. On
+    # 2026-08-05 it picked this process at 5.5 GB, and before that ClickHouse.
+    #
+    # PARQUET_ROW_GROUP_ROWS is the knob if this ever needs to be smaller;
+    # halving it roughly halves the plateau, at the cost of more dictionary
+    # restarts and a larger footer.
+    mem_limit: 2g
     environment:
       LOCAL_OUTPUT_DIR: /out
     volumes:
