@@ -32,6 +32,28 @@
         <default>
             <output_format_parquet_row_group_size>10000</output_format_parquet_row_group_size>
             <output_format_parquet_row_group_size_bytes>8388608</output_format_parquet_row_group_size_bytes>
+
+            <!-- The one that actually made the export complete.
+
+                 With the default parallelism ClickHouse reads far faster than
+                 the HTTP client can write the result to disk, and buffers the
+                 difference: failing exports reported 5.5 to 6.0 GiB of query
+                 memory. Held to one thread the read paces itself against the
+                 writer and the same hour finishes at 76 MiB.
+
+                 Measured on hour 16, 153M rows, with the ceiling at 7.2 GiB:
+
+                   default threads  failed at 3.64 GB after 188 s
+                   max_threads=2    failed at 1.33 GB after 48 s
+                   max_threads=1    COMPLETE, 5.54 GB in 394 s
+
+                 Slower, and it does not matter: the exporter has an hour to
+                 write an hour, and 394 seconds is well inside that.
+
+                 Set on the profile rather than per query so the exporter picks
+                 it up without touching upstream's Python. Nothing else queries
+                 this server. -->
+            <max_threads>1</max_threads>
         </default>
     </profiles>
 </clickhouse>
