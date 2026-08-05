@@ -33,11 +33,27 @@ services:
     # before the cgroup acts, and the cgroup acts before the kernel starts
     # choosing victims across the whole host, which is what it did on 2026-08-05.
     #
-    # 5 GB is close to the ceiling of what this box can give. It has 14 GB; the
-    # three collector services measure ~4.7 GB together and the unrelated
-    # containers another ~2.5 GB. Raising this further needs memory freed
-    # somewhere else first, not optimism.
-    mem_limit: 5g
+    # 8g, and the number is larger than it looks because most of what fills a
+    # cgroup here is page cache, which the kernel reclaims on demand.
+    #
+    # This started at 4g and went to 5g while the hourly export kept failing at
+    # a ceiling the server was nowhere near: RSS 1.74 GiB against a tracker
+    # claiming 4.50 GiB. The tracker was not wrong so much as measuring
+    # something else. ClickHouse observes the cgroup's memory usage to size
+    # itself, `memory.current` counts page cache from reading its own data
+    # files, and this workload reads constantly, so the cgroup looked full while
+    # actual anonymous memory sat under 2 GiB.
+    #
+    # Setting max_server_memory_usage to 0 does not escape it either: 0 means
+    # auto, which is 0.9 * the cgroup, i.e. the same number again.
+    #
+    # So the limit has to leave room for cache on top of anonymous memory rather
+    # than being sized against anonymous memory alone. The host's actual
+    # commitment is unchanged: ClickHouse has held 1.5-2.4 GiB resident
+    # throughout, the collector's three services ~4.7 GB, unrelated containers
+    # ~2.5 GB, of 14 GB total. What grows here is reclaimable, and the cgroup
+    # still contains a genuine runaway to this container.
+    mem_limit: 8g
     volumes:
       - ./clickhouse-config.d/polym2-memory.xml:/etc/clickhouse-server/config.d/polym2-memory.xml:ro
       - ./clickhouse-users.d/polym2-parquet.xml:/etc/clickhouse-server/users.d/polym2-parquet.xml:ro
