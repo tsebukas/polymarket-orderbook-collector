@@ -28,12 +28,23 @@
 <clickhouse>
     <profiles>
         <default>
-            <!-- The fix. Above this much, the sort spills to disk instead of
-                 being held whole. Sorting an hour is inherent to how the
-                 exporter builds its files, so the choice is between spilling and
-                 failing; there is 270 GB free and the export has an hour to
-                 write an hour. -->
-            <max_bytes_before_external_sort>2147483648</max_bytes_before_external_sort>
+            <!-- Above this much, the sort spills to disk instead of being held
+                 whole. Sorting an hour is inherent to how the exporter builds
+                 its files, so the choice is between spilling and failing.
+
+                 512 MiB, down from the 2 GiB this started at. 2 GiB was enough
+                 to let the query finish on an idle server but not next to a
+                 live 2.5M rows/min insert stream: on 2026-08-05 the exports of
+                 hours 17 and 20 died mid-stream at code 241, with the query
+                 itself holding 3.3-3.7 GiB against a 7.2 GiB total ceiling.
+                 Those hours were lost rather than written short, which is the
+                 row-count guard doing its job, but lost all the same.
+
+                 Spilling earlier trades wall-clock for headroom, and there is
+                 wall-clock to spare: a full hour exports in 850 s against the
+                 3600 s it has. Disk is not the constraint either, with 255 GB
+                 free. -->
+            <max_bytes_before_external_sort>536870912</max_bytes_before_external_sort>
 
             <!-- Pace the reader against whatever consumes the result. With
                  default parallelism ClickHouse reads far faster than the client
