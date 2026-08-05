@@ -5,7 +5,7 @@
 #   docker compose -f docker-compose.polymarket.yml -f docker-compose.polym2.yml up -d --build
 #
 # Deliberately a separate file rather than edits in place, so the fork stays
-# readable as a diff against upstream. Three departures from upstream:
+# readable as a diff against upstream. Five departures from upstream:
 #
 #   1. EXCLUDE_HASH=false — we keep Polymarket's book hash in the data. Upstream
 #      strips it; we need it to audit the dedup change after the fact.
@@ -16,24 +16,60 @@
 #      Only takes effect on a *fresh* table: the sink applies the TTL clause at
 #      CREATE TABLE, so changing it later does nothing until the table is
 #      dropped.
+#   4. MAX_ASSETS_PER_CONN + PONG_TIMEOUT_SECONDS — one pair, not two settings;
+#      see below.
+#   5. Log rotation on every service. Not a collector setting at all, but the
+#      run has already lost a disk to it once — see the bottom of this file.
 #
 # COLLECTOR_OUT is the host directory the snapshots are written to; set it in
 # .env or the environment. Everything else is upstream's default.
 
+x-logging: &rotated-logs
+  # json-file with no options grows without bound. During the 2026-08-04 run the
+  # WS pool alone wrote a 36.7 GB log in eleven hours — `asset_degraded` /
+  # `asset_healthy` at churn rate — and `docker logs` on it became unusable
+  # because every query rescans the file from the start. 300 MB x 3 is ample for
+  # diagnosing a stall and bounds the whole pool at ~3.6 GB.
+  driver: json-file
+  options:
+    max-size: "300m"
+    max-file: "3"
+
 services:
+  obdata-polymarket-active-markets:
+    logging: *rotated-logs
+
   obdata-polymarket-orderbook-rust-pubsub:
+    logging: *rotated-logs
     environment:
       EXCLUDE_HASH: "false"
-      # Upstream's 500 puts ~272k assets on ~1090 connections, and that does not
-      # hold from a single address: the client PINGs every connection every 10 s
-      # and kills any socket whose PONG is over 5 s late (ws/connection.rs), so
-      # ~109 PING/s starts timing out, every timeout reconnects and re-subscribes
-      # its assets, and the added load times out the next batch. Observed half
-      # the pool down and worsening, with 64k assets on no live connection at
-      # all. 2500 puts the same universe on ~220 connections.
+      # MAX_ASSETS_PER_CONN and PONG_TIMEOUT_SECONDS are one decision.
+      #
+      # Upstream's 500 puts ~272k assets on ~1090 connections, which does not
+      # hold from a single address: ~109 PING/s starts timing out, every timeout
+      # reconnects and re-subscribes that connection's assets, and the added
+      # load times out the next batch. Observed half the pool down and
+      # worsening, with 64k assets on no live connection at all.
+      #
+      # 2500 puts the same universe on ~220 connections and traded that failure
+      # for the opposite one: PONG is a text message in the *same* stream as the
+      # data, so on a socket carrying 2500 assets it queues behind thousands of
+      # data messages and cannot answer within the old 5 s. 84% of PINGs timed
+      # out and the pool churned just as badly.
+      #
+      # So the connection count needs the timeout raised with it. 60 s is still
+      # far tighter than "this socket is dead" requires, and the heartbeat's
+      # only job is detecting death — a healthy busy socket is not a dead one.
+      #
+      # Raising this was impossible before the fix in ws/connection.rs: the
+      # overdue check measured from the most recent PING, which the ticker
+      # rewrote every PING_INTERVAL, so any value at or above PING_INTERVAL
+      # silently disabled dead-connection detection instead of loosening it.
       MAX_ASSETS_PER_CONN: "2500"
+      PONG_TIMEOUT_SECONDS: "60"
 
   obdata-polymarket-orderbook-rust-from-pubsub:
+    logging: *rotated-logs
     environment:
       EXCLUDE_HASH: "false"
       # ~2 days. Enough for the exporter (which lags an hour) to drain, and it
@@ -41,6 +77,7 @@ services:
       TTL_MINUTES: "2880"
 
   obdata-polymarket-r2-archive-exporter:
+    logging: *rotated-logs
     environment:
       LOCAL_OUTPUT_DIR: /out
     volumes:
