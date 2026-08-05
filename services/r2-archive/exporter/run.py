@@ -8,6 +8,18 @@ credentials are needed. ClickHouse's own FORMAT Parquet writer never emits
 DELTA, so we fetch FORMAT ArrowStream and re-encode client-side (pass 6 in
 docs/data-dump-optimizations.md).
 
+The hour is **streamed**, never held: the ArrowStream response is consumed
+batch by batch and written a row group at a time, so peak memory is
+``PARQUET_ROW_GROUP_ROWS`` and not the size of the export. This matters at
+volume — an earlier version buffered the response body, the Arrow table and
+the finished Parquet file in turn, and the kernel killed it at 5.5 GB on an
+hour of 25.8M rows.
+
+Because ClickHouse returns HTTP 200 before the first batch, a mid-stream
+failure looks like a body that simply ends. Every export therefore checks the
+rows written against ``SELECT count()`` for the same hour and refuses to
+publish on a mismatch; see [`stream_hour`].
+
 Profiles, selected via ``EXPORTER_PROFILE`` env (default ``polymarket``):
 
 * ``polymarket`` — rewrites the raw-JSON ``polymarket_orderbook_rust``
@@ -34,11 +46,13 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from pathlib import Path
+from typing import BinaryIO, Iterator
 
 import boto3
 import pyarrow as pa
@@ -71,6 +85,18 @@ LOCAL_OUTPUT_DIR = os.environ.get("LOCAL_OUTPUT_DIR", "")
 # Export
 PARQUET_COMPRESSION = "zstd"
 PARQUET_COMPRESSION_LEVEL = 9
+# Rows per row group. This is the knob that sets peak memory: the exporter
+# holds one group's worth of Arrow batches, not the hour.
+#
+# 1048576 is not a round-ish guess, it is Arrow's own default
+# `max_row_group_length`, which is what the buffered writer was already
+# clamping to. Keeping it means the streamed file has the same row-group
+# boundaries as every file the archive already holds. Shrinking it costs
+# dictionary restarts (a dictionary is built per column per row group) and
+# footer growth, not compression itself — zstd works per data page either way.
+PARQUET_ROW_GROUP_ROWS = int(os.environ.get("PARQUET_ROW_GROUP_ROWS", "1048576"))
+# Bytes pulled from the socket at a time while streaming the response.
+STREAM_CHUNK_BYTES = 1 << 20
 EXPORT_DELAY_MINUTES = int(os.environ.get("EXPORT_DELAY_MINUTES", "5"))
 EXPORT_LAG_HOURS = int(os.environ.get("EXPORT_LAG_HOURS", "1"))
 LOOP_CHECK_INTERVAL_SECONDS = int(os.environ.get("LOOP_CHECK_INTERVAL_SECONDS", "60"))
@@ -298,40 +324,209 @@ def query_earliest_hour() -> datetime | None:
     return None
 
 
-def fetch_hour_parquet(hour: datetime) -> bytes | None:
-    """Fetch one hour of rows via the active profile's SELECT template,
-    encode as Parquet with DELTA on integer timestamps + ZSTD(9) dict
-    elsewhere, and return the bytes (or ``None`` for an empty hour).
+def query_hour_row_count(hour: datetime) -> int:
+    """Count the rows ClickHouse holds for one hour.
+
+    Read before the export and compared against what was actually written, so
+    a short read cannot pass as a complete file. See [`stream_hour`].
     """
     target = hour.strftime("%Y-%m-%d %H:00:00")
-    select_order_by = ", ".join(SELECT_ORDER_BY)
-    query = PROFILE.select_template.format(
-        source_table=CLICKHOUSE_TABLE,
-        target=target,
-        order_by=select_order_by,
+    resp = _ch_query(
+        f"SELECT count() FROM {CLICKHOUSE_TABLE} "
+        f"WHERE timestamp_received >= toDateTime64('{target}', 3) "
+        f"AND timestamp_received < toDateTime64('{target}', 3) + INTERVAL 1 HOUR "
+        "FORMAT TabSeparated",
+        timeout=120,
     )
-    arrow_bytes = _ch_query(query, timeout=600).content
+    return int(resp.text.strip())
 
-    with pa.ipc.open_stream(pa.BufferReader(arrow_bytes)) as reader:
-        table = reader.read_all()
 
-    if table.num_rows == 0:
-        return None
+class _ResponseStream:
+    """Exact-read file adapter over a streaming HTTP response.
 
-    delta_cols = [c for c in PROFILE.delta_encoded_columns if c in table.column_names]
-    dict_cols = [c for c in table.column_names if c not in delta_cols]
+    Arrow's IPC reader asks for N bytes and treats a short return as a corrupt
+    stream — it calls ``read`` once and does not loop. ``urllib3`` promises
+    only *up to* N, so handing it ``resp.raw`` works by luck of the common path
+    rather than by contract, and stops working the moment a transfer encoding
+    is involved. This loops until it has N bytes or the body genuinely ends.
 
-    out = BytesIO()
-    pq.write_table(
-        table,
-        out,
+    Reading through ``iter_content`` also means a mid-transfer failure surfaces
+    as a ``requests`` exception rather than a urllib3 error leaking through the
+    Arrow layer.
+    """
+
+    def __init__(self, resp: requests.Response, chunk_size: int = STREAM_CHUNK_BYTES) -> None:
+        self._chunks = resp.iter_content(chunk_size)
+        self._buf = bytearray()
+        self._pos = 0
+        self.closed = False
+
+    def _pull(self) -> bool:
+        """Append one chunk. False once the body is exhausted."""
+        for chunk in self._chunks:
+            if chunk:
+                self._buf += chunk
+                return True
+        return False
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            while self._pull():
+                pass
+            n = len(self._buf)
+        while len(self._buf) < n:
+            if not self._pull():
+                break
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        self._pos += len(out)
+        return out
+
+    def assert_exhausted(self) -> None:
+        """Raise if anything follows what Arrow consumed.
+
+        Arrow stops at the end-of-stream marker without looking further. If the
+        server appended an error after starting a successful body — which
+        ClickHouse does — or if the connection died, the remainder shows up
+        here or as a ``ChunkedEncodingError`` from ``iter_content``.
+        """
+        if self._buf or self._pull():
+            raise RuntimeError(
+                "trailing bytes after the Arrow stream ended — "
+                "the response was not what it claimed to be"
+            )
+
+    def tell(self) -> int:
+        return self._pos
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _hour_query(hour: datetime) -> str:
+    """Build the profile's SELECT for one hour."""
+    return PROFILE.select_template.format(
+        source_table=CLICKHOUSE_TABLE,
+        target=hour.strftime("%Y-%m-%d %H:00:00"),
+        order_by=", ".join(SELECT_ORDER_BY),
+    )
+
+
+def _parquet_writer(sink: BinaryIO, schema: pa.Schema) -> pq.ParquetWriter:
+    """Open a writer with the archive's encoding, derived from the stream's schema.
+
+    Same encoding the whole archive was built with: DELTA_BINARY_PACKED on the
+    integer timestamp columns, ZSTD(9) dictionary elsewhere. ClickHouse's own
+    FORMAT Parquet never emits DELTA, which is why the re-encode exists at all.
+    """
+    delta_cols = [c for c in PROFILE.delta_encoded_columns if c in schema.names]
+    dict_cols = [c for c in schema.names if c not in delta_cols]
+    return pq.ParquetWriter(
+        sink,
+        schema,
         compression=PARQUET_COMPRESSION,
         compression_level=PARQUET_COMPRESSION_LEVEL,
         use_dictionary=dict_cols,
         column_encoding={c: "DELTA_BINARY_PACKED" for c in delta_cols},
         data_page_version="2.0",
     )
-    return out.getvalue()
+
+
+def stream_hour(client: Destination, key: str, hour: datetime) -> int | None:
+    """Stream one hour from ClickHouse straight into the destination.
+
+    Returns the number of rows written, or ``None`` for an empty hour (no file
+    is created, and the caller keeps polling).
+
+    Nothing here holds the hour. ClickHouse's ArrowStream response is consumed
+    batch by batch and handed to a [`pq.ParquetWriter`] a row group at a time,
+    so peak memory is [`PARQUET_ROW_GROUP_ROWS`] rather than the whole export.
+    The previous version read the response body, the Arrow table and the
+    finished Parquet file into memory in turn, and was killed by the kernel at
+    5.5 GB on a 25.8M-row hour.
+
+    **A truncated read must never become a short file.** ClickHouse sends
+    HTTP 200 before the first batch, so a mid-stream failure arrives as a body
+    that simply stops; the status line has already promised success. That is
+    why the row count is checked against [`query_hour_row_count`] and a
+    mismatch raises: the destination's context manager then discards the
+    partial file rather than publishing it.
+    """
+    expected = query_hour_row_count(hour)
+    if expected == 0:
+        return None
+
+    auth = (CLICKHOUSE_USER, CLICKHOUSE_PASSWORD) if CLICKHOUSE_PASSWORD else None
+    written = 0
+    with requests.post(
+        CLICKHOUSE_HTTP_URL,
+        data=_hour_query(hour).encode(),
+        auth=auth,
+        # Per socket read, not total. The first read blocks for the whole
+        # server-side sort, which is minutes on a full hour.
+        timeout=(30, 3600),
+        stream=True,
+        # No compression layer to unwrap: ClickHouse only compresses when the
+        # client asks, and one header removes a whole class of framing bug.
+        headers={"Accept-Encoding": "identity"},
+    ) as resp:
+        resp.raise_for_status()
+        body = _ResponseStream(resp)
+
+        with pa.ipc.open_stream(body) as reader:
+            schema = reader.schema
+            with client.open_write(key) as sink:
+                writer = _parquet_writer(sink, schema)
+                try:
+                    pending: list[pa.RecordBatch] = []
+                    pending_rows = 0
+                    for batch in reader:
+                        if batch.num_rows == 0:
+                            continue
+                        pending.append(batch)
+                        pending_rows += batch.num_rows
+                        # Slice to exactly the target. Flushing "at least N"
+                        # would hand the writer N plus a partial batch, which
+                        # it splits into a full group and a runt — one small
+                        # row group per flush, which is the layout this whole
+                        # loop exists to avoid.
+                        while pending_rows >= PARQUET_ROW_GROUP_ROWS:
+                            table = pa.Table.from_batches(pending, schema)
+                            writer.write_table(
+                                table.slice(0, PARQUET_ROW_GROUP_ROWS),
+                                row_group_size=PARQUET_ROW_GROUP_ROWS,
+                            )
+                            written += PARQUET_ROW_GROUP_ROWS
+                            rest = table.slice(PARQUET_ROW_GROUP_ROWS)
+                            pending, pending_rows = rest.to_batches(), rest.num_rows
+                    if pending_rows:
+                        writer.write_table(
+                            pa.Table.from_batches(pending, schema),
+                            row_group_size=PARQUET_ROW_GROUP_ROWS,
+                        )
+                        written += pending_rows
+                finally:
+                    # Closes even while an exception propagates, so a truncated
+                    # stream still gets a valid footer written over short data.
+                    # That file is only harmless because open_write discards on
+                    # exception — do not move the commit into a finally.
+                    writer.close()
+
+                if written != expected:
+                    raise RuntimeError(
+                        f"row count mismatch for {key}: ClickHouse reported {expected}, "
+                        f"wrote {written} — refusing to publish a partial file"
+                    )
+
+        body.assert_exhausted()
+
+    return written
 
 
 # ---------- R2 ----------
@@ -372,9 +567,21 @@ class R2Client:
                 return keys
             kwargs["ContinuationToken"] = resp["NextContinuationToken"]
 
-    def upload(self, key: str, data: bytes) -> None:
-        """Upload an in-memory blob to the bucket."""
-        self._client.upload_fileobj(BytesIO(data), self._bucket, key)
+    @contextmanager
+    def open_write(self, key: str) -> Iterator[BinaryIO]:
+        """Yield a file to write the object into, uploading it on clean exit.
+
+        Staged through a temp file rather than memory, because the caller
+        streams an hour that does not fit. Nothing is uploaded if the body
+        raises, so a failed export leaves no object behind.
+        """
+        tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+        try:
+            with tmp:
+                yield tmp
+            self._client.upload_file(tmp.name, self._bucket, key)
+        finally:
+            os.unlink(tmp.name)
 
 
 # ---------- Local filesystem ----------
@@ -395,19 +602,42 @@ class LocalSink:
     def ensure_bucket(self) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
         log.info("Writing snapshots to %s", self._dir)
+        # A killed process leaves its .part behind: open_write cleans up on an
+        # exception, but nothing runs on SIGKILL, and this exporter has been
+        # OOM-killed mid-write before. list_keys already ignores them, so these
+        # are wasted disk rather than a correctness problem — but on a full
+        # hour that is gigabytes of it.
+        for stale in self._dir.glob(f"{FILENAME_PREFIX}*.parquet.part"):
+            log.warning("Removing stale partial export %s", stale.name)
+            stale.unlink(missing_ok=True)
 
     def list_keys(self) -> set[str]:
         return {p.name for p in self._dir.glob(f"{FILENAME_PREFIX}*.parquet")}
 
-    def upload(self, key: str, data: bytes) -> None:
+    @contextmanager
+    def open_write(self, key: str) -> Iterator[BinaryIO]:
+        """Yield the ``.part`` file, renaming it into place on clean exit.
+
+        The rename is the whole point: a reader — or an rsync pulling this
+        directory while the exporter runs — either sees the finished snapshot
+        or nothing at all, never a prefix of one. If the body raises, the
+        partial file is removed and the final name is never created, which is
+        what makes a failed or short export safe rather than silently wrong.
+        """
         final = self._dir / key
         partial = final.with_suffix(final.suffix + ".part")
-        partial.write_bytes(data)
-        os.replace(partial, final)
+        try:
+            with open(partial, "wb") as fh:
+                yield fh
+            os.replace(partial, final)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
 
 
-# Either destination satisfies the ensure_bucket / list_keys / upload surface
-# that the orchestration below uses; nothing there cares which one it holds.
+# Either destination satisfies the ensure_bucket / list_keys / open_write
+# surface that the orchestration below uses; nothing there cares which one it
+# holds.
 Destination = R2Client | LocalSink
 
 
@@ -429,19 +659,22 @@ def latest_exportable_hour() -> datetime:
 
 
 def export_hour(client: Destination, hour: datetime) -> bool:
-    """Fetch one hour from ClickHouse and upload it to R2.
+    """Stream one hour from ClickHouse into the destination.
 
-    Returns True if an object was uploaded, False if the hour has no rows
+    Returns True if an object was written, False if the hour has no rows
     (the caller should keep polling until data appears).
+
+    The elapsed time is logged deliberately. The export has one hour to write
+    an hour, and if it ever stops fitting the exporter falls behind for good.
     """
     filename = hour_to_filename(hour)
     log.info("Exporting %s", filename)
-    data = fetch_hour_parquet(hour)
-    if data is None:
+    started = time.monotonic()
+    rows = stream_hour(client, filename, hour)
+    if rows is None:
         log.info("Skipping %s: 0 rows, will retry next tick", filename)
         return False
-    client.upload(filename, data)
-    log.info("Uploaded %s (%.2f MB)", filename, len(data) / (1024 * 1024))
+    log.info("Wrote %s (%d rows, %.1fs)", filename, rows, time.monotonic() - started)
     return True
 
 

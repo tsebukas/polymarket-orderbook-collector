@@ -90,6 +90,13 @@ services:
 
   obdata-polymarket-r2-archive-exporter:
     logging: *rotated-logs
+    # The exporter now streams an hour rather than holding it, so it should sit
+    # a few hundred MB regardless of how big the hour is. This bounds a
+    # regression to the container: restart: unless-stopped revives it and the
+    # hour is retried, instead of the kernel picking a victim across a 14 GB
+    # host. On 2026-08-05 it picked this process at 5.5 GB, and before that
+    # ClickHouse.
+    mem_limit: 1g
     environment:
       LOCAL_OUTPUT_DIR: /out
     volumes:
