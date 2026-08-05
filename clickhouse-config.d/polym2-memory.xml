@@ -40,17 +40,22 @@
   which crash-loops the container.
 -->
 <clickhouse>
-    <!-- 4.5 GiB, sitting below the 5 GB cgroup limit in the compose overlay so
-         ClickHouse hits its own accounting first and can fail gracefully.
+    <!-- 0 means no internal ceiling: the container's cgroup limit is the only
+         bound, and it is the one that matters.
 
-         Started at 3.5 GiB, which held the database up but starved the hourly
-         export: a full hour is ~153M rows and the export competes with live
-         inserts and merges rather than running on a quiet server, so it failed
-         at every row-group size tried. See clickhouse-users.d/polym2-parquet.xml
-         for those measurements.
+         This was 3.5 GiB and then 4.5 GiB, and both refused the hourly export
+         while the server was demonstrably not out of memory. The query_log shows
+         why: an export that ran 69 seconds reported `memory_usage` of 75.83 MiB
+         and still failed, with the tracker claiming 4.50 GiB used against an
+         actual RSS of 1.74 GiB. Under sustained heavy inserts ClickHouse's
+         accounting runs well ahead of resident memory, so an explicit ceiling
+         turns that drift into hard refusals of work the box can plainly afford.
 
-         Not raised further because the host has 14 GB and the rest of it is
-         spoken for: the three collector services measure ~4.7 GB together and
-         the unrelated containers another ~2.5 GB. -->
-    <max_server_memory_usage>4831838208</max_server_memory_usage>
+         The cgroup does not drift. If ClickHouse genuinely exceeds `mem_limit`
+         the kernel kills it inside its own cgroup, which costs a restart and the
+         in-flight batch but leaves the host alone. That containment was the real
+         goal here: on 2026-08-05 the kill was `global_oom` and the kernel was
+         choosing victims across the whole machine. A contained restart is a bad
+         outcome; losing every export is a worse one. -->
+    <max_server_memory_usage>0</max_server_memory_usage>
 </clickhouse>
