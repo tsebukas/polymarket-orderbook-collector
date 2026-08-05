@@ -1,0 +1,38 @@
+# polym2 overrides for the infrastructure stack.
+#
+# Layered on top of docker-compose.infra.yml, never instead of it:
+#
+#   docker compose -f docker-compose.infra.yml -f docker-compose.infra.polym2.yml up -d
+#
+# One concern only: keep watchtower away from this stack for the duration of a
+# multi-day run.
+#
+# The three collector images are built locally under compose-prefixed names that
+# exist in no registry, so watchtower cannot touch them whatever it is told.
+# These three are different -- `clickhouse/clickhouse-server:25.8`,
+# `redis:7-alpine` and dozzle's pinned tag are public, and the first two are
+# floating minor tags that do receive patch updates. Watchtower's remedy for an
+# updated image is to recreate the container, which means stopping ClickHouse
+# underneath a running collector.
+#
+# That is not a restart we survive cleanly. The sink is fire-and-forget: a
+# ClickHouse outage drops events rather than retrying them, so a mid-run update
+# is a permanent hole in exactly the data the run exists to produce, and it
+# would land without warning at whatever hour watchtower happens to poll.
+#
+# Only meaningful if the host actually runs watchtower; harmless if it does not.
+# `server.lan` does, unscoped and with WATCHTOWER_INCLUDE_STOPPED=true, so it
+# would also act on these while they are merely stopped between runs.
+
+services:
+  obdata-clickhouse:
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+
+  obdata-redis:
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+
+  dozzle:
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
