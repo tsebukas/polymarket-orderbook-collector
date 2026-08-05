@@ -15,29 +15,32 @@
 
   Two defences, and the order matters:
 
-    1. `max_server_memory_usage` makes ClickHouse refuse work it cannot afford,
-       returning MEMORY_LIMIT_EXCEEDED instead of growing into the OOM killer.
-       A failed insert is a visible error in the sink's [DATA-GAP] log; an
-       OOM kill is a silent restart. Both lose data, but only one tells you.
+    1. `max_server_memory_usage` below makes ClickHouse refuse work it cannot
+       afford, returning MEMORY_LIMIT_EXCEEDED instead of growing into the OOM
+       killer. A refused insert is a visible error in the sink's [DATA-GAP] log;
+       an OOM kill is a silent restart. Both lose data, only one tells you.
     2. `mem_limit` in the compose overlay is the backstop, one step above this,
        so a miss here is contained to this container rather than the host.
 
-  Careful with comments in this file: XML forbids a double hyphen inside one,
-  and ClickHouse refuses to start on a malformed config rather than skipping it,
+  The real reduction in merge memory is not here at all: it is TTL_MINUTES going
+  from 2880 to 360 in docker-compose.polym2.yml, which takes the table from ~6.3
+  billion rows to ~780 million. This file only stops a bad hour from taking the
+  host with it.
+
+  Deliberately nothing else. An earlier version also set `background_pool_size`
+  and `max_bytes_to_merge_at_max_space_in_pool`, which was speculative tuning and
+  did not survive contact: MergeTree cross-checks those against each other, and
+  a pool of 8 is smaller than the default
+  `number_of_free_entries_in_pool_to_execute_mutation` of 20, so the server
+  refused to start. Tune the pool only with the whole set of related defaults in
+  hand.
+
+  Careful with comments in this file: XML forbids a double hyphen inside one, and
+  ClickHouse refuses to start on a malformed config rather than skipping it,
   which crash-loops the container.
 -->
 <clickhouse>
     <!-- 3.5 GiB. Sits below the 4 GB cgroup limit in the compose overlay so
          ClickHouse hits its own accounting first and can fail gracefully. -->
     <max_server_memory_usage>3758096384</max_server_memory_usage>
-
-    <!-- Fewer concurrent merges means a lower peak. The insert path is cheap at
-         our rate; it was merges over a multi-billion-row table that blew the
-         budget, and the 6-hour TTL plus this together keep them small. -->
-    <background_pool_size>8</background_pool_size>
-
-    <!-- Do not start a merge that would need more than 10 GB of free disk. Not
-         a memory setting, but the same class of protection: `/` is shared with
-         the OS and every other service on this box. -->
-    <max_bytes_to_merge_at_max_space_in_pool>10737418240</max_bytes_to_merge_at_max_space_in_pool>
 </clickhouse>
